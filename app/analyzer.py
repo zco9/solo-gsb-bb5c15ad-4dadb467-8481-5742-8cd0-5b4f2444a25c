@@ -201,6 +201,59 @@ def _addr_count(networks: Iterable[ipaddress._BaseNetwork]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Containment-tree construction
+# ---------------------------------------------------------------------------
+#: Address width of each IP family, in bits.
+_FAMILY_BITS: dict[int, int] = {4: 32, 6: 128}
+
+
+def _link_containment_parents(nodes_by_version: dict[int, list[Node]]) -> None:
+    """Link every node to its nearest strict parent, per IPv4/IPv6 family.
+
+    The naive builder compared every node against every other node of the same
+    family (O(n^2)), which is wasteful for rule sets made of large numbers of
+    mutually-disjoint prefixes interspersed with multi-level nesting.
+
+    Each family instead gets a *prefix index* mapping
+    ``(prefixlen, address-in-prefix-units)`` to the node holding that exact
+    prefix; the prefix-unit value is the network address shifted right so it
+    occupies the top ``prefixlen`` bits.  For a node at prefix length L its
+    strict parent must be registered at one of the shorter lengths L-1 .. 0
+    and share its top ``prefixlen`` bits, so probing those levels from L-1
+    downward and stopping at the first hit yields the nearest (longest-prefix)
+    enclosing node.  Cost is O(n * L) per family with L = 32 for IPv4 and 128
+    for IPv6 — independent of how many mutually-disjoint nodes the family
+    contains.  Same-CIDR rules have already been merged into one node, so
+    every index key is unique within a family.
+    """
+    for version, version_nodes in nodes_by_version.items():
+        family_bits = _FAMILY_BITS[version]
+        prefix_index: dict[tuple[int, int], Node] = {
+            (
+                node.network.prefixlen,
+                int(node.network.network_address) >> (family_bits - node.network.prefixlen),
+            ): node
+            for node in version_nodes
+        }
+
+        for node in version_nodes:
+            net = node.network
+            prefix_value = int(net.network_address) >> (family_bits - net.prefixlen)
+            best: Node | None = None
+            # Walk the node's own prefix chain level by level, longest first.
+            for parent_len in range(net.prefixlen - 1, -1, -1):
+                candidate = prefix_index.get(
+                    (parent_len, prefix_value >> (net.prefixlen - parent_len))
+                )
+                if candidate is not None:
+                    best = candidate
+                    break
+            node.parent = best
+            if best is not None:
+                best.children.append(node)
+
+
+# ---------------------------------------------------------------------------
 # Canonicalization / idempotency hash
 # ---------------------------------------------------------------------------
 def canonical_input(rules: list[InputRule]) -> str:
@@ -242,22 +295,7 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
         version_nodes.sort(key=lambda n: (int(n.network.network_address), n.network.prefixlen))
 
     # ---- Build containment trie (nearest enclosing winning node) --------
-    for version, version_nodes in nodes_by_version.items():
-        for node in version_nodes:
-            net = node.network
-            best: Node | None = None
-            best_prefix = -1
-            for candidate in version_nodes:
-                if candidate is node:
-                    continue
-                cnet = candidate.network
-                if cnet.prefixlen < net.prefixlen and net.subnet_of(cnet):
-                    if cnet.prefixlen > best_prefix:
-                        best = candidate
-                        best_prefix = cnet.prefixlen
-            node.parent = best
-            if best is not None:
-                best.children.append(node)
+    _link_containment_parents(nodes_by_version)
 
     for version_nodes in nodes_by_version.values():
         for node in version_nodes:
