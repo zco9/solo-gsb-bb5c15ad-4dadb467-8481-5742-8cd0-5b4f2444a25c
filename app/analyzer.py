@@ -34,6 +34,7 @@ jumped over.  The result is deterministic for identical input.
 
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import json
 from dataclasses import dataclass, field
@@ -41,6 +42,10 @@ from hashlib import sha256
 from typing import Any, Iterable
 
 ANALYZER_VERSION = "1.0.0"
+
+#: Address width per family; used by the prefix index to truncate an address
+#: to a candidate supernet boundary without constructing network objects.
+_FAMILY_WIDTH: dict[int, int] = {4: 32, 6: 128}
 
 # Accepted action spellings.
 ACTION_ALIASES: dict[str, str] = {
@@ -201,6 +206,60 @@ def _addr_count(networks: Iterable[ipaddress._BaseNetwork]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Containment trie
+# ---------------------------------------------------------------------------
+def _link_containment_tree(version: int, version_nodes: list[Node]) -> None:
+    """Link each node to its nearest strict-parent node of one address family.
+
+    A *prefix index* maps, for every populated prefix length, the network
+    address (truncated to that boundary) to the node owning it.  For a node at
+    prefix length ``p`` its strict parents can only sit at shorter prefix
+    lengths whose boundary the node's address lies on.  Walking the populated
+    lengths ``p-1, p-2, ...`` and probing the index finds the nearest (longest)
+    enclosing network on the first hit.  The number of probed levels is bounded
+    by the address width (at most 32 for IPv4, 128 for IPv6) rather than by the
+    number of nodes, so large sets of mutually disjoint ("sparse") networks
+    stay cheap.
+
+    Every family member is inserted before any lookups happen, hence the
+    result does not depend on traversal/input order.
+    """
+    width = _FAMILY_WIDTH[version]
+    by_length: dict[int, dict[int, Node]] = {}
+    for node in version_nodes:
+        length = node.network.prefixlen
+        bucket = by_length.get(length)
+        if bucket is None:
+            bucket = {}
+            by_length[length] = bucket
+        bucket[int(node.network.network_address)] = node
+    # Distinct populated prefix lengths in ascending order (at most 33 for
+    # IPv4 / 129 for IPv6).
+    populated_lengths = sorted(by_length)
+
+    for node in version_nodes:
+        net = node.network
+        length = net.prefixlen
+        addr = int(net.network_address)
+        best: Node | None = None
+        # Populated strict-shorter lengths, nearest (longest) first.
+        stop = bisect.bisect_left(populated_lengths, length)
+        for idx in range(stop - 1, -1, -1):
+            parent_len = populated_lengths[idx]
+            # Truncate the node's address to the candidate prefix boundary;
+            # a hit means a network at that exact supernet exists.  For /0 the
+            # mask (1 << width) - 1 covers all bits, so the boundary is 0.
+            boundary = addr & (~((1 << (width - parent_len)) - 1))
+            candidate = by_length[parent_len].get(boundary)
+            if candidate is not None:
+                best = candidate
+                break
+        node.parent = best
+        if best is not None:
+            best.children.append(node)
+
+
+# ---------------------------------------------------------------------------
 # Canonicalization / idempotency hash
 # ---------------------------------------------------------------------------
 def canonical_input(rules: list[InputRule]) -> str:
@@ -242,22 +301,15 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
         version_nodes.sort(key=lambda n: (int(n.network.network_address), n.network.prefixlen))
 
     # ---- Build containment trie (nearest enclosing winning node) --------
+    # One prefix index per address family: prefix length -> (truncated network
+    # address -> node).  Each node's strict parent is found by level: walk the
+    # prefix lengths shorter than its own (largest first) and look up the
+    # address truncated to that boundary; the first hit is the nearest strict
+    # parent.  This is O(n * W) family-wide (W = 32 for IPv4, 128 for IPv6)
+    # and independent of how many mutually disjoint nodes exist, replacing the
+    # former O(n^2) scan of every same-family candidate.
     for version, version_nodes in nodes_by_version.items():
-        for node in version_nodes:
-            net = node.network
-            best: Node | None = None
-            best_prefix = -1
-            for candidate in version_nodes:
-                if candidate is node:
-                    continue
-                cnet = candidate.network
-                if cnet.prefixlen < net.prefixlen and net.subnet_of(cnet):
-                    if cnet.prefixlen > best_prefix:
-                        best = candidate
-                        best_prefix = cnet.prefixlen
-            node.parent = best
-            if best is not None:
-                best.children.append(node)
+        _link_containment_tree(version, version_nodes)
 
     for version_nodes in nodes_by_version.values():
         for node in version_nodes:

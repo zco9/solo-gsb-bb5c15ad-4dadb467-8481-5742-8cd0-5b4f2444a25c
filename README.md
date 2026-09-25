@@ -1378,6 +1378,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
 ├── tests/test_api.py           # 端到端测试（pytest + TestClient）
+├── tests/test_containment_index.py # 包含树前缀索引测试（稀疏/嵌套性能与结果、与 O(n²) 扫描等价、analyze 与预演一致）
 ├── tests/test_active.py        # 发布指针与乐观锁（含并发发布）测试
 ├── tests/test_diff.py          # 语义差异端点测试
 ├── tests/test_change_guard.py  # 变更守卫端点测试
@@ -1424,6 +1425,11 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 
 ### 复杂度
 
-trie 构建对每个节点线性扫描候选祖先，复杂度约 O(n²)，适合数百至数千条规则的策略集；
-覆盖差集基于标准库 `ipaddress.address_exclude`。若需要超大规模（数万条以上），可将
-祖先查找替换为按版本分组的 radix tree，分析器输出契约不变。
+包含树（containment trie）的构建按 IPv4/IPv6 **分别建立前缀索引**：对每个已出现的前缀长度
+维护"网络地址 → trie 节点"的映射；为一个节点寻找最近严格父网段时，只从比它短一级的前缀
+长度开始逐级向更短前缀探测（IPv4 最多 32 级、IPv6 最多 128 级），首次命中即最近严格父网段。
+同族构建复杂度约为 **O(n·W)**（W 为地址位宽，32/128），不再随互不包含（稀疏）网段数量平方
+增长；大量互不包含或多层嵌套的规则集都能快速建树。覆盖差集基于标准库
+`ipaddress.address_exclude`，分析器输出契约（有效覆盖、冲突对、发现顺序、`ruleset_hash`、
+版本 ID）与逐节点扫描的实现完全一致，`POST /api/analyze` 与调用分析器的各预演接口
+（simulate / merge-precheck / quarantine-plan 等）输出保持一致。
