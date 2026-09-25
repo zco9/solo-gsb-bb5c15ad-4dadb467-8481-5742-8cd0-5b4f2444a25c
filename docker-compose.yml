@@ -1,0 +1,21 @@
+services:
+  prefix-analyzer:
+    build: .
+    image: prefix-policy-analyzer:latest
+    container_name: prefix-policy-analyzer
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      PREFIX_DB_PATH: /data/prefix_policy.db
+    volumes:
+      - prefix_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  prefix_data:
